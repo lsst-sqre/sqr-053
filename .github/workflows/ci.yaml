@@ -25,6 +25,7 @@ jobs:
 
       - name: Build
         run: |
+          docker-compose up -d
           make html
 
       - name: Upload
