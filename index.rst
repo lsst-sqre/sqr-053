@@ -1,61 +1,445 @@
-..
-  Technote content.
-
-  See https://developer.lsst.io/restructuredtext/style.html
-  for a guide to reStructuredText writing.
-
-  Do not put the title, authors or other metadata in this document;
-  those are automatically added.
-
-  Use the following syntax for sections:
-
-  Sections
-  ========
-
-  and
-
-  Subsections
-  -----------
-
-  and
-
-  Subsubsections
-  ^^^^^^^^^^^^^^
-
-  To add images, add the image file (png, svg or jpeg preferred) to the
-  _static/ directory. The reST syntax for adding the image is
-
-  .. figure:: /_static/filename.ext
-     :name: fig-label
-
-     Caption text.
-
-   Run: ``make html`` and ``open _build/html/index.html`` to preview your work.
-   See the README at https://github.com/lsst-sqre/lsst-technote-bootstrap or
-   this repo's README for more info.
-
-   Feel free to delete this instructional comment.
-
 :tocdepth: 1
-
-.. Please do not modify tocdepth; will be fixed when a new Sphinx theme is shipped.
 
 .. sectnum::
 
-.. TODO: Delete the note below before merging new content to the master branch.
-
 .. note::
 
-   **This technote is not yet published.**
+  You can download the code in this technote and execute it as a Jupyter notebook.
+  You also need to download the `docker-compose.yaml`_ file used to start the required services.
 
-   Capture CAP meeting discussions and final decision on how to represent missing values in the EFD.
+  .. _docker-compose.yaml: https://raw.githubusercontent.com/lsst-sqre/sqr-053/tickets/DM-28696/docker-compose.yaml
 
-.. Add content here.
-.. Do not include the document title (it's automatically added from metadata.yaml).
+  :jupyter-download:nb:`Download Jupyter notebook <index>`
 
-.. .. rubric:: References
 
-.. Make in-text citations with: :cite:`bibkey`.
+Abstract
+========
 
-.. .. bibliography:: local.bib lsstbib/books.bib lsstbib/lsst.bib lsstbib/lsst-dm.bib lsstbib/refs.bib lsstbib/refs_ads.bib
-..    :style: lsst_aa
+We recommend adopting the symbol ``NaN`` to represent missing values for floating-point data types in the CSCs.
+The InfluxDB Sink connector skip ``NaN`` values and correctly designate them as "missing" in InfluxDB. However, the symbol ``NaN`` works for floating-point data types only.
+There are no equivalent symbols for other data types that work as well accross the different systems in our data flow. In particular, we discourage using a valid number (e.g. ``-99``) as sentinel value for representing missing values.
+That said, using ``NaN`` to represent missing values for floating-point types solves the problem for about 80% of the fields in Telemetry topics.
+During this investigation, we also found that DDS has system default values for each IDL type.
+We recommend overwriting the DDS default values for floating-point types to ``NaN``, in which case DDS will automatically fill in with ``NaN`` a field that exists in the topic schema but is omitted by the CSC.
+
+Introduction
+============
+
+Telescope & Site implements :abbr:`CSCs (Commandable SAL Components)` for about 60 different telescope subsystems.
+The CSCs publish data to :abbr:`DDS (Data Distribution Service)`, and this data is recorded in the :abbr:`EFD (Engineering and Facility Database)`.
+
+Missing values can occur in different ways:
+
+- **A field is not implement**. A situation that is often encountered during integration and testing is a DDS topic with a field that exists in the topic schema, but is not implemented in the CSC yet. That happened when testing the Main Telescope Camera Cable Wrap subsystem recently.
+
+- **A sensor produces no values**. Another situation, which can happen at anytime, is when a sensor goes offline.
+
+- **A sensor produces invalid values**. For example, the Environment subsystem has a sensor that measures snow depth. The sensor may produce invalid values if there is no snow. In this case the CSC might represent those values as missing.
+
+In these situations, a value is designated as "missing" in the EFD, and high-level context information (e.g. from the Event logs) is usually required to know why the value is missing.
+
+In practice, we need a representation for missing values when one or more field values in a topic are missing.
+In this case, there is a timestamp, and there may be other fields with valid values to record in the EFD.
+
+In section :ref:`representation` we discuss alternatives for representing missing values.
+In section :ref:`data-flow` ee review the data flow and how the different systems involved handle missing values.
+Finally, in section :ref:`conclusion` we conclude this investigation with a solution that works for most of the cases, and ensures that we can handle missing values in a convenient way when using the `EFD client`_, the supported method for accessing EFD data.
+
+.. _EFD client: https://efd-client.lsst.io/
+
+
+.. _representation:
+
+Representing missing values
+===========================
+
+Generally, there are two approaches for representing missing values, one uses a mask to indicate the null status of a value, and the other uses a sentinel value.
+
+In the sentinel value approach, a sentinel value indicates the missing value.
+It can use some data-specific convention such as  ``-99`` or use a more global convention, such as ``NaN`` (Not a Number), a symbol that is part of the `IEEE 754`_ floating-point specification.
+The sentinel value may or may not be stored. See, for example, the `sparse data structures`_ in Pandas.
+
+.. _IEEE 754: https://standards.ieee.org/standard/754-2019.html
+
+.. _sparse data structures: https://pandas.pydata.org/pandas-docs/stable/user_guide/sparse.html#sparse-data-structures
+
+The two approaches have trade-offs.
+In particular, not all systems support masking.
+While a sentinel value like ``-99`` works for all numeric types, it may cause problems because it is a valid number.
+The problem with ``NaN`` is that it is available for floating-point types only.
+
+Most systems support derived data types, where it is possible to mark a member of the derived data type as optional and/or specify a default value for it.
+In this case, if the missing value is omitted, the system will automatically fill in a default value on behalf of the application.
+However, the question of which symbol to use as the default value for every primitive data type still remains.
+
+.. _data-flow:
+
+The data flow
+=============
+
+Different systems use different conventions for representing missing values.
+We have to ensure the representation we use works throughout the complete data flow:
+
+``CSCs -> DDS -> SAL Kafka -> Kafka -> InfluxDB Sink -> InfluxDB -> EFD Client``
+
+`CSCs`_ are implemented in multiple languages (C++, LabVIEW, Java, and Python) and publish records to DDS topics.
+
+.. _CSCs: https://ts-xml.lsst.io/#master-csc-table
+
+`SAL Kafka`_ and `InfluxDB Sink`_ are of particular importance because they are responsible for converting the records between the data formats used by the different systems.
+SAL Kafka converts the DDS records into Avro records and forwards them to Kafka.
+SAL Kafka is also responsible for converting the IDL schema to Avro schema and registering them with the Kafka schema registry.
+The InfluxDB Sink connector uses the Avro schemas to deserialize the Avro records and convert them into the InfluxDB line protocol format before writing to InfluxDB.
+
+.. _SAL Kafka: https://ts-salkafka.lsst.io/
+.. _InfluxDB Sink: https://docs.lenses.io/4.1/integrations/connectors/stream-reactor/sinks/influxsinkconnector/
+
+Finally, the `EFD client`_ reads from InfluxDB and returns a Pandas dataframe.
+
+.. _EFD client: https://efd-client.lsst.io/
+
+In summary, we need to understand how each system handles missing values and how data conversion between them is done.
+
+
+CSCs
+----
+
+The `ts_xml`_ repository contains the interface definition for all CSCs.
+
+As of Feb 5, 2021, ``ts_xml`` defines the schema for 249 Telemetry, 390 Commands, and 533 Events topics for about 60 different subsystems.
+From ``ts_xml``, :abbr:`SAL (Software Abstraction Layer)` creates the schema used by DDS in the :abbr:`IDL (Interface Definition Language)` format.
+
+.. _ts_xml: https://github.com/lsst-ts/ts_xml
+
+In Table 1, we show the number of fields in the ``ts_xml`` schema per IDL type in Telemetry, Commands, and Events topics.
+
+.. _table-1:
+
+.. table:: The number of fields in the ``ts_xml`` schema per IDL type in Telemetry, Commands, and Events topics. In parentheses, new names for fixed-width integer types as introduced in IDL 4.2.
+
+    +-----------------------------+-----------+----------+---------+
+    | IDL type                    | Telemetry | Commands | Events  |
+    +=============================+===========+==========+=========+
+    | ``boolean``                 | 197       | 181      | 604     |
+    +-----------------------------+-----------+----------+---------+
+    | ``byte``                    | 2         | 7        | 11      |
+    +-----------------------------+-----------+----------+---------+
+    | ``octet*``                  | 2         | 2        | 2       |
+    +-----------------------------+-----------+----------+---------+
+    | ``char*``                   | 1         | 1        | 1       |
+    +-----------------------------+-----------+----------+---------+
+    | ``string``                  | 43        | 83       | 467     |
+    +-----------------------------+-----------+----------+---------+
+    | ``int``                     | 8         | 44       | 102     |
+    +-----------------------------+-----------+----------+---------+
+    | ``short (int16)``           | 9         | 66       | 12      |
+    +-----------------------------+-----------+----------+---------+
+    | ``long (int32)``            | 36        | 67       | 267     |
+    +-----------------------------+-----------+----------+---------+
+    | ``long long (int64)``       | 3         | 2        | 13      |
+    +-----------------------------+-----------+----------+---------+
+    | ``unsigned int*``           | 2         | 2        | 2       |
+    +-----------------------------+-----------+----------+---------+
+    | ``unsigned short (uint16)`` | 8         | 2        | 6       |
+    +-----------------------------+-----------+----------+---------+
+    | ``unsigned long (uint32)``  | 3         | 2        | 4       |
+    +-----------------------------+-----------+----------+---------+
+    | ``float``                   | 437       | 137      | 358     |
+    +-----------------------------+-----------+----------+---------+
+    | ``double``                  | 1091      | 206      | 800     |
+    +-----------------------------+-----------+----------+---------+
+    | **Total**                   | **1842**  | **802**  | **2649**|
+    +-----------------------------+-----------+----------+---------+
+    | ``*`` Only present in test topics.                           |
+    +--------------------------------------------------------------+
+
+For the EFD, telemetry is where a representation for missing values is more important.
+From Table 1, the majority of the telemetry fields (83%) have ``float`` or ``double`` IDL types.
+
+In Table 1, arrays are counted only once. When the topic field is an array, we show the type of the array items.
+
+Table 2 shows the number of arrays in the ``ts_xml`` schema per array size in Telemetry topics for arrays larger than 50 elements. The largest arrays are from the ``MTCamera``, ``MTM1M3`` subsystems and usually have ``float`` or ``double`` IDL types. However, there are fairly large arrays in the ``MTM1M3TS`` and ``MTM2`` subsystems with ``boolean``, ``unsigned short`` or ``long`` IDL types as well.
+
+
+.. _table-2:
+
+.. table:: The largest arrays in Telemetry topics in the ``ts_xml`` schema.
+
+    +------------+-------------+------------------------+---------------------------------+
+    | Array size | # of arrays | Type of the array item | Subsystem                       |
+    +============+=============+========================+=================================+
+    | 3024       | 1           | ``double``             | ``MTCamera``                    |
+    +------------+-------------+------------------------+---------------------------------+
+    | 197        | 6           | ``double``             | ``MTCamera``                    |
+    +------------+-------------+------------------------+---------------------------------+
+    | 156        | 5           | ``float, double``      | ``MTM1M3``                      |
+    +------------+-------------+------------------------+---------------------------------+
+    | 144        | 1           | ``double``             | ``MTCamera``                    |
+    +------------+-------------+------------------------+---------------------------------+
+    | 112        | 3           | ``float``              | ``MTM1M3``                      |
+    +------------+-------------+------------------------+---------------------------------+
+    | 100        | 62          | ``float, double``      | ``ATMCS, ATPtg, MTPtg, MTM1M3`` |
+    +------------+-------------+------------------------+---------------------------------+
+    | 96         | 7           | ``boolean, float``     | ``MTM1M3TS``                    |
+    +------------+-------------+------------------------+---------------------------------+
+    | 78         | 1           | ``unsigned short``     | ``MTM2``                        |
+    +------------+-------------+------------------------+---------------------------------+
+    | 72         | 7           | ``long, double``       | ``MTM2``                        |
+    +------------+-------------+------------------------+---------------------------------+
+    | 71         | 85          | ``double``             | ``MTCamera``                    |
+    +------------+-------------+------------------------+---------------------------------+
+    | 68         | 6           | ``float``              | ``MTDome``                      |
+    +------------+-------------+------------------------+---------------------------------+
+    | 67         | 5           | ``double``             | ``MTCamera``                    |
+    +------------+-------------+------------------------+---------------------------------+
+    | 50         | 18          | ``double``             | ``MTVMS``                       |
+    +------------+-------------+------------------------+---------------------------------+
+
+
+DDS
+---
+
+The `DDS type system`_ has annotations specify the default values for fields in the IDL schema.
+
+.. _DDS type system: https://community.rti.com/static/documentation/connext-dds/6.0.0/doc/manuals/connext_dds/getting_started_extras/RTI_ConnextDDS_CoreLibraries_GettingStarted_ExtensibleTypesAddendum.pdf
+
+
+Table 3 shows the system default values in DDS for the most common IDL types.
+
+.. _table-3:
+
+.. table:: System default values in DDS.
+
+    +--------------------------------+-------------------------------------+
+    | IDL type                       | Default value                       |
+    +================================+=====================================+
+    | ``boolean``                    | ``FALSE``                           |
+    +--------------------------------+-------------------------------------+
+    | ``byte``                       | ``0x00``                            |
+    +--------------------------------+-------------------------------------+
+    | ``int16, int32, int64,``       | ``0``                               |
+    +--------------------------------+-------------------------------------+
+    | ``uint16, uint32, uint64,``    | ``0``                               |
+    +--------------------------------+-------------------------------------+
+    | ``float, double, long double`` | ``0``                               |
+    +--------------------------------+-------------------------------------+
+    | ``char``                       | ``'\0'``                            |
+    +--------------------------------+-------------------------------------+
+    | ``string``                     | ``""``                              |
+    +--------------------------------+-------------------------------------+
+    | ``enum``                       | The first value in the enumeration. |
+    +--------------------------------+-------------------------------------+
+
+The ``@default`` annotation is used to overwrite the system default values in Table 3.
+
+.. code-block:: none
+  :emphasize-lines: 4
+
+  struct MyTopic {
+    long id; # default value is 0
+    float x;  # default value is 0
+    @default(NaN) float y; # default value is NaN
+  };
+
+In the example above, the ``@default`` annotation overwrites the default value of the ``MyTopic.y`` field to ``NaN``.
+If this field is omitted by the CSC that publishes this topic, DDS would automatically fill in the default value ``NaN`` for the application that subscribes to it.
+
+The default value of an enumeration corresponds to the first value in the enumeration.
+The ``@default_literal`` annotation is used to select a different value in the enumeration as the default value.
+
+.. code-block:: none
+  :emphasize-lines: 3
+
+  enum Color {
+    GREEN,
+    @default_literal RED,
+    BLUE
+  };
+
+
+Currently, there is no mechanism to overwrite the DDS system default values for fields in the CSCs interface definition (``ts_xml``). A possible alternative to use ``NaN`` as the default value for ``float``, ``double``, and ``long double`` IDL types, is to modify SAL to use the ``@default`` annotation when creating the IDL schema.
+
+In summary, an application that subscribes to a DDS topic will get what the CSCs publishes or the DDS system default values presented in Table 3.
+
+Kafka
+-----
+
+We use `Apache Avro`_ to enconde messages in Kafka.
+In Avro ``records`` the default value for a field can be specified as follows:
+
+.. code-block:: js
+  :emphasize-lines: 6
+
+  {
+    "type": "record",
+    "name": "foo",
+    "fields" : [
+      {"name": "bar", "type": "float"},
+      {"name": "baz", "type": "float", "default": NaN} // field baz default to NaN
+    ]
+  }
+
+From this and previous sections, SAL Kafka can, in principle, convert an IDL schema with default values into an Avro schema with default values.
+
+Also, we have confirmed that ``NaN`` values in a DDS record are passed along to Kafka by SAL Kafka as ``NaN``.
+
+.. _`Apache Avro`: https://avro.apache.org/docs/current/spec.html
+
+InfluxDB
+--------
+
+InfluxDB represents a point in a time series by the `line protocol`_:
+
+.. _line protocol: https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/
+
+.. code-block:: none
+
+  <measurement>[,<tag_key>=<tag_value>[,<tag_key>=<tag_value>]] <field_key>=<field_value> [,<field_key>=<field_value>] [<timestamp>]
+
+In the EFD, a **mesasurement** corresponds to a DDS topic, and **tags** are metadata associated with **fields**.
+In InfluxDB, we specify a **timestamp** in the Unix epoch.
+If a timestamp is not specified, InfluxDB uses the server's local time with nanosecond precision.
+
+In the simplest case, if tags and timestamps are not specified, the above simplifies to:
+
+.. code-block:: none
+
+  <measurement> <field_key>=<field_value>[,<field_key>=<field_value>]
+
+In InfluxDB 1.8, the default type for field values is ``float``, however InfluxDB 1.8 does not support ``NaN`` values (see InfluxDB `data types`_), which has been subject to a `long debate`_.
+
+.. _data types: https://docs.influxdata.com/influxdb/v1.8/write_protocols/line_protocol_reference/#data-types
+.. _long debate: https://github.com/influxdata/influxdb/issues/4089
+
+
+We can show that by running a local instance of InfluxDB.
+
+.. jupyter-execute::
+
+  %%bash
+  docker-compose up -d influxdb
+
+By default, the InfluxDB API runs at http://localhost:8086. Let's use the Python ``requests`` module to interact with the InfluxDB API and create the ``mydb`` database for our tests:
+
+.. jupyter-execute::
+
+  import requests
+  requests.post(url="http://localhost:8086/query", params={'q':'CREATE DATABASE "mydb"'})
+
+
+Now let's write a point to the measurement ``foo`` with a field key ``bar`` and value ``NaN``:
+
+
+.. jupyter-execute::
+
+  p = "foo bar=NaN"
+  r = requests.post(url="http://localhost:8086/write?db=mydb", data=p)
+  r.text
+
+This confirms that we cannot use ``NaN`` in InfluxDB to represent a missing value for the ``float`` type.
+
+However, because InfluxDB is a schema-less database, we can change the schema on write.
+We can add new fields or drop existing fields at any time.
+This suggests that fields are optional and that InfluxDB should automatically fill them in with a default value.
+
+To verify this property of InfluxDB, let's write a sequence of points, and change the schema as we write.
+
+.. jupyter-execute::
+  :emphasize-lines: 2
+
+  p1 = "foo bar=1.0,baz=1.0"
+  p2 = "foo baz=2.0"
+  p3 = "foo bar=3.0,baz=3.0"
+  requests.post(url="http://localhost:8086/write?db=mydb", data=p1)
+  requests.post(url="http://localhost:8086/write?db=mydb", data=p2)
+  requests.post(url="http://localhost:8086/write?db=mydb", data=p3)
+
+The following query returns the ``foo`` measurement:
+
+.. jupyter-execute::
+
+  r = requests.get(url="http://localhost:8086/query", params={'q': 'SELECT * FROM "mydb"."autogen"."foo"'})
+  r.json()['results'][0]['series']
+
+Notice that when querying the foo measurement, InfluxDB returns ``None`` for the missing value of bar in the second point.
+The Python keyword ``None`` is used here as the default value for an optional parameter (the InfluxDB field in this case), as expected.
+
+The InfluxDB Sink connector is the right place for handling missing values.
+In particular, the ``influxdb-java`` library used by the connector, `skips fields with NaN values`_ when writing to InfluxDB.
+This feature was implemented upstream a month after we first noticed this problem back in September 2019, during the AuxTel integration activities at the Summit.
+
+.. _skips fields with NaN values: https://github.com/influxdata/influxdb-java/blob/master/CHANGELOG.md#216-2019-10-25
+.. _writing NaN values to InfluxDB: https://jira.lsstcorp.org/browse/DM-21300
+
+
+In summary, fields are optional, and we should skip missing values when writing to InfluxDB.
+
+Filling in time intervals with no data
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When querying InfluxDB, you can `group the result by time intervals and use fill()`_  to specify how InfluxDB handles time intervals with no data.
+
+.. _group the result by time intervals and use fill(): https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#group-by-time-intervals-and-fill
+
+For example, this query will resample the values on a regular time grid of ``10ms`` and use ``fill(linear)`` to perform a linear interpolation for time intervals with no data:
+
+.. jupyter-execute::
+
+  r = requests.get(url="http://localhost:8086/query", params={'q': 'SELECT mean(baz), mean(baz) FROM "mydb"."autogen"."foo" GROUP BY time(10ms) fill(linear)'})
+  r.json()['results'][0]['series']
+
+Writing arrays to InfluxDB
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+InfluxDB does not support derived types like arrays, the solution we found was to `extract the array items`_ in the InfluxDB Sink connector and write them to individual fields in InfluxDB.
+
+.. _extract the array items: https://kafka-connect-manager.lsst.io/userguide.html#recording-arrays-in-influxdb
+
+For sparse arrays with ``NaN`` values the connector will extract them and skip ``NaN`` values before writing to InfluxDB.
+
+For example, if the Avro record contains a field with the array ``[1.0, NaN, 2.0]``, the InfluxDB Sink connector will first extract the array items into the field set ``foo1=1.0,foo2=NaN,foo3=2.0`` and then write ``foo1=1.0,foo3=3.0`` to InfluxDB.
+
+
+The EFD client
+--------------
+
+The EFD client uses the `aioinflux`_ Python client for InfluxDB.
+
+.. _aioinflux: https://aioinflux.readthedocs.io/
+
+Here we show that missing values in InfluxDB are converted back to ``NaN`` when ``aioinflux`` returns a Pandas dataframe:
+
+.. jupyter-execute::
+
+  from aioinflux import InfluxDBClient
+  client = InfluxDBClient(db="mydb", output="dataframe")
+  await client.query('SELECT * FROM foo')
+
+which is a convenient way of representing missing values with the Pandas ``float64`` dtype. For more information on working with missing data in Pandas, we refer the reader to `this guide`_.
+
+.. _this guide: https://pandas.pydata.org/pandas-docs/stable/user_guide/missing_data.html
+
+
+Recommendations
+===============
+
+-  We recommend adopting the symbol ``NaN`` to represent missing values for floating-point data types in the CSCs.
+
+- For DDS topics with sparse arrays of floating-point data types, we also recommend filling in the missing values with ``NaN`` values.
+
+- We should consider using the ``@default`` annotation in the IDL specification to set the default values for ``float``,  ``double`` and ``long double`` fields to ``NaN`` instead of ``0``. That would prevent the InfluxDB Sink connector from recording a ``0`` to InfluxDB when it should instead skip the ``NaN`` value.
+
+- There is no obvious symbol to represent missing values for other data types that works across all systems in our data flow. We recommend revisiting this issue only if it becomes a problem in the future and follow as much as possible what Pandas does.
+
+.. _conclusion:
+
+Conclusion
+==========
+
+In this investigation we demonstrate that the symbol ``NaN`` can be used to represent missing values for floating-point data types across all systems in our data flow. While this is a partial solution to the problem, we showed that it covers about 80% of the fields in Telemetry topics.
+
+With this solution in place, a field with the value ``NaN`` in a DDS record is passed along to an Avro record in Kafka.
+The InfluxDB Sink connector skip ``NaN`` values before writing to InfluxDB so that they are correctly represented as "missing" in InfluxDB.
+In particular, we showed that when querying InfluxDB in Python, it fills the missing values with ``None``.
+
+Finally, in the EFD client, missing values in InfluxDB are returned back as ``NaN`` which is a convenient way of representing missing values in Pandas.
