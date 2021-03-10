@@ -15,12 +15,13 @@
 Abstract
 ========
 
-We recommend adopting the symbol ``NaN`` to represent missing values for floating-point data types in the CSCs.
-The InfluxDB Sink connector skip ``NaN`` values and correctly designate them as "missing" in InfluxDB. However, the symbol ``NaN`` works for floating-point data types only.
-There are no equivalent symbols for other data types that work as well accross the different systems in our data flow. In particular, we discourage using a valid number (e.g. ``-99``) as sentinel value for representing missing values.
-That said, using ``NaN`` to represent missing values for floating-point types solves the problem for about 80% of the fields in Telemetry topics.
-During this investigation, we also found that DDS has system default values for each IDL type.
-We recommend overwriting the DDS default values for floating-point types to ``NaN``, in which case DDS will automatically fill in with ``NaN`` a field that exists in the topic schema but is omitted by the CSC.
+We demonstrate that the symbol ``NaN`` can be used to represent missing values for floating-point data types across all systems involved in the data flow, from the moment the data is published by a CSC until it is read by the EFD client.
+However, the symbol ``NaN`` works for floating-point data types only.
+There is no equivalent symbol for other data types that work as well as ``NaN`` across all systems.
+In particular, we discourage using a valid number (e.g. ``-99``) as sentinel value for representing missing values.
+That said, using ``NaN`` to represent missing values for floating-point types solves the problem for about 80% of the fields in Telemetry topics.
+We also found that DDS has system default values for each IDL type.
+We recommend overwriting the DDS default values for floating-point types to ``NaN``, in which case DDS will automatically fill in with ``NaN`` a field that exists in the topic schema but is omitted by the CSC.
 
 Introduction
 ============
