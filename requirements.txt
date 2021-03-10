@@ -2,3 +2,5 @@ documenteer[technote]>=0.6.0
 jupyter-sphinx
 jupyter
 nbconvert
+aioinflux
+pandas
